@@ -1,73 +1,51 @@
-# --------------------------------------------------------------------------
-# --- IMPORTS: All necessary libraries for the pipeline ---
-# --------------------------------------------------------------------------
-from fastapi import FastAPI, Depends, HTTPException, status
+import os
+import uuid
+from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Form
 from pydantic import BaseModel, EmailStr
-from passlib.context import CryptContext
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
 
-# --------------------------------------------------------------------------
-# --- Part 1: DATABASE CONNECTION (The "Output" End of the Pipeline) ---
-# This section defines how your pipeline connects to a database.
-# The "Database Person" on your team would typically provide this.
-# --------------------------------------------------------------------------
-
-# The connection string for a simple SQLite database file.
 SQLALCHEMY_DATABASE_URL = "sqlite:///./registration_pipeline.db"
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
 
-# A factory for creating database sessions (conversations).
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# A base class for database models.
 Base = declarative_base()
 
-# A placeholder database model. The "Database Person" would define the final version.
-class User(Base):
-    __tablename__ = "users"
+UPLOAD_DIRECTORY = "uploads"
+os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
+
+
+class Registration(Base):
+    __tablename__ = "registrations"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
 
-# Create the actual database tables from the model definition above.
 Base.metadata.create_all(bind=engine)
 
-# --------------------------------------------------------------------------
-# --- Part 2: DATA CONTRACT (The "Input" End of the Pipeline) ---
-# These models define the data structure you expect from the frontend.
-# This is your "agreement" with the "Frontend Person".
-# --------------------------------------------------------------------------
-
-class UserCreate(BaseModel):
-    """Data you EXPECT to receive from the frontend."""
-    username: str
-    email: EmailStr  # Pydantic automatically validates the email format.
-    password: str
-
-class UserResponse(BaseModel):
-    """Data you PROMISE to send back to the frontend on success."""
-    id: int
-    username: str
+class RegistrationForm(BaseModel):
+    name: str
     email: EmailStr
+    student_id: str
+    branch: str
+    year: int
+    division: str
+    roll_no: int
+    transaction_id: str
+
+class RegistrationResponse(RegistrationForm):
+    id: int
+    screenshot_filename: str
     class Config:
         from_attributes = True
 
-# --------------------------------------------------------------------------
-# --- Part 3: THE PIPELINE LOGIC (Your Core Responsibility) ---
-# This is the main application that receives, processes, and saves the data.
-# --------------------------------------------------------------------------
-
 app = FastAPI()
 
-# Password hashing setup (a crucial security step in your pipeline).
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Dependency to get a database session for a single request.
 def get_db():
     db = SessionLocal()
     try:
@@ -75,38 +53,75 @@ def get_db():
     finally:
         db.close()
 
-@app.post("/register/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register_user_pipeline(user_data: UserCreate, db: Session = Depends(get_db)):
-    """
-    This is the main connectivity pipeline. It takes data from the frontend,
-    processes it, and sends it to the database.
-    """
-    print(f"Pipeline received data for email: {user_data.email}")
+@app.post("/register/", response_model=RegistrationResponse, status_code=status.HTTP_201_CREATED)
+async def create_registration_pipeline(
+    db: Session = Depends(get_db),
+  
+    name: str = Form(...),
+    email: EmailStr = Form(...),
+    student_id: str = Form(...),
+    branch: str = Form(...),
+    year: int = Form(...),
+    division: str = Form(...),
+    roll_no: int = Form(...),
+    transaction_id: str = Form(...),
+    screenshot: UploadFile = File(...)
+):
+ 
+    print(f"Pipeline received registration request for email: {email}")
 
-    # --- PROCESSING STEP 1: Check for duplicates ---
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
-    if existing_user:
-        print("Processing failed: Email already exists.")
+ 
+    existing_registration = db.query(Registration).filter(
+        (Registration.email == email) | (Registration.student_id == student_id)
+    ).first()
+
+    if existing_registration:
+        print("Processing failed: Email or Student ID already exists.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered."
+            detail="A registration with this Email or Student ID already exists."
         )
 
-    # --- PROCESSING STEP 2: Secure the password ---
-    hashed_password = pwd_context.hash(user_data.password)
-    print("Processing: Password has been securely hashed.")
+  
+    if not screenshot.filename:
+        raise HTTPException(status_code=400, detail="No screenshot file was uploaded.")
 
-    # --- PROCESSING STEP 3: Format data for the database ---
-    new_user_record = User(
-        username=user_data.username,
-        email=user_data.email,
-        hashed_password=hashed_password
+   
+    unique_id = uuid.uuid4()
+    file_extension = os.path.splitext(screenshot.filename)[1]
+    unique_filename = f"{unique_id}{file_extension}"
+    file_path = os.path.join(UPLOAD_DIRECTORY, unique_filename)
+
+    try:
+        
+        contents = await screenshot.read()
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        print(f"Processing: Screenshot saved as '{unique_filename}'")
+    except Exception as e:
+        print(f"Error saving file: {e}")
+        raise HTTPException(status_code=500, detail="There was an error uploading the file.")
+    finally:
+        await screenshot.close()
+
+
+   
+    new_registration = Registration(
+        name=name,
+        email=email,
+        student_id=student_id,
+        branch=branch,
+        year=year,
+        division=division,
+        roll_no=roll_no,
+        transaction_id=transaction_id,
+        screenshot_filename=unique_filename 
     )
 
-    # --- FINAL STEP: Send data to the database ---
-    db.add(new_user_record)
+    
+    db.add(new_registration)
     db.commit()
-    db.refresh(new_user_record) # Get the new ID from the database.
-    print(f"Pipeline finished: User {new_user_record.username} saved with ID {new_user_record.id}.")
+    db.refresh(new_registration)
+    print(f"Pipeline finished: Registration saved with ID {new_registration.id}.")
 
-    return new_user_record
+    return new_registration
